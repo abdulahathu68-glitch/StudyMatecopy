@@ -1,0 +1,138 @@
+name: Build StudyMate AI (Windows)
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  APP_DIR: StudyMate-AI-main
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: StudyMate-AI-main
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Enable Windows desktop
+        run: flutter config --enable-windows-desktop
+
+      - name: Generate Windows runner if needed
+        shell: pwsh
+        run: |
+          if (!(Test-Path windows/runner)) { flutter create --platforms=windows . }
+
+      - name: Use StudyMate logo as app icon
+        shell: pwsh
+        run: |
+          Copy-Item assets/branding/studymate_app_icon.ico windows/runner/resources/app_icon.ico -Force
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        shell: pwsh
+        run: |
+          flutter analyze --no-pub --no-fatal-infos --no-fatal-warnings 2>&1 | Tee-Object -FilePath analyze.log
+          if ($LASTEXITCODE -ne 0) { throw 'flutter analyze found errors (see analyze.log)' }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: analyze-log
+          path: StudyMate-AI-main/analyze.log
+          if-no-files-found: ignore
+
+      - name: Build release
+        run: flutter build windows --release
+
+      - name: Build llama-server and whisper-cli from source
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp llama-src
+          git clone --depth 1 https://github.com/ggerganov/whisper.cpp whisper-src
+          # Portable build: no CPU-specific code from the CI machine, no OpenMP DLL,
+          # C runtime linked in, so the exe starts on any x64 PC with AVX2.
+          $common = @(
+            '-DCMAKE_BUILD_TYPE=Release',
+            '-DBUILD_SHARED_LIBS=OFF',
+            '-DGGML_NATIVE=OFF',
+            '-DGGML_AVX2=ON',
+            '-DGGML_OPENMP=OFF',
+            '-DCMAKE_POLICY_DEFAULT_CMP0091=NEW',
+            '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded'
+          )
+          cmake -S llama-src -B llama-build @common -DLLAMA_CURL=OFF
+          cmake --build llama-build --config Release --target llama-server -j 4
+          cmake -S whisper-src -B whisper-build @common
+          cmake --build whisper-build --config Release --target whisper-cli -j 4
+          $bin = Join-Path 'build/windows/x64/runner/Release' 'bin'
+          New-Item -ItemType Directory -Force -Path $bin | Out-Null
+          $llama = Get-ChildItem llama-build -Recurse -Filter llama-server.exe | Select-Object -First 1
+          $whisper = Get-ChildItem whisper-build -Recurse -Filter whisper-cli.exe | Select-Object -First 1
+          if (-not $llama -or -not $whisper) { throw 'The build did not produce llama-server.exe or whisper-cli.exe' }
+          Copy-Item $llama.FullName $bin -Force
+          Copy-Item $whisper.FullName $bin -Force
+          Get-ChildItem llama-build -Recurse -Filter *.dll | ForEach-Object { Copy-Item $_.FullName $bin -Force }
+          Get-ChildItem whisper-build -Recurse -Filter *.dll | ForEach-Object { Copy-Item $_.FullName $bin -Force }
+          Write-Host 'Files in bin:'
+          Get-ChildItem $bin | ForEach-Object { Write-Host "  $($_.Name)  $($_.Length)" }
+
+      - name: Smoke test llama-server.exe
+        shell: pwsh
+        run: |
+          $exe = Join-Path 'build/windows/x64/runner/Release/bin' 'llama-server.exe'
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) { throw "llama-server.exe failed to start, exit code $LASTEXITCODE" }
+          Write-Host 'llama-server.exe started correctly.'
+
+      - name: Download Visual C++ Redistributable for the installer
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path redist | Out-Null
+          Invoke-WebRequest -Uri 'https://aka.ms/vs/17/release/vc_redist.x64.exe' -OutFile 'redist/vc_redist.x64.exe'
+          if (!(Test-Path 'redist/vc_redist.x64.exe')) { throw 'Could not download vc_redist.x64.exe' }
+
+      - name: Package ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive -Path 'build/windows/x64/runner/Release/*' -DestinationPath 'StudyMate-AI-Windows.zip' -Force
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          choco install innosetup --yes --no-progress
+          & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' installer.iss
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StudyMate-AI-Windows
+          path: StudyMate-AI-main/StudyMate-AI-Windows.zip
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StudyMate-AI-Setup
+          path: StudyMate-AI-main/StudyMate-AI-Setup.exe
+          if-no-files-found: error
+
+      - name: Publish Windows release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            StudyMate-AI-main/StudyMate-AI-Windows.zip
+            StudyMate-AI-main/StudyMate-AI-Setup.exe
