@@ -97,6 +97,25 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "llama-server.exe failed to start, exit code $LASTEXITCODE" }
           Write-Host 'llama-server.exe started correctly.'
 
+      - name: List DLLs needed by llama-server.exe
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $dumpbin = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio' -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1
+          if (-not $dumpbin) { Write-Host 'dumpbin.exe not found, skipping'; exit 0 }
+          $exe = 'build/windows/x64/runner/Release/bin/llama-server.exe'
+          $out = & $dumpbin.FullName /dependents $exe
+          $out | Write-Host
+          $deps = $out | Where-Object { $_ -match '^\s+\S+\.dll\s*$' } | ForEach-Object { $_.Trim() }
+          $bin = 'build/windows/x64/runner/Release/bin'
+          $system = 'kernel32|user32|advapi32|shell32|ole32|oleaut32|ws2_32|bcrypt|crypt32|secur32|ntdll|gdi32|winmm|shlwapi|iphlpapi|userenv|version|api-ms-win|ucrtbase|dbghelp|psapi|wsock32|mswsock|rpcrt4|comdlg32|imm32|setupapi|cfgmgr32|normaliz|wldap32|msvcrt'
+          foreach ($d in $deps) {
+            $inBin = Test-Path (Join-Path $bin $d)
+            $isSystem = $d -match $system
+            if (-not $inBin -and -not $isSystem) { Write-Host "NOT BUNDLED: $d" }
+          }
+
       - name: Download Visual C++ Redistributable for the installer
         shell: pwsh
         run: |
