@@ -62,21 +62,26 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/ggml-org/llama.cpp llama-src
           git clone --depth 1 https://github.com/ggerganov/whisper.cpp whisper-src
-          # Portable build: no CPU-specific code from the CI machine, no OpenMP DLL,
-          # C runtime linked in, so the exe starts on any x64 PC with AVX2.
+          # No OpenSSL, no curl, no OpenMP, no CPU-specific code:
+          # the exe depends only on DLLs that ship with Windows or in the bin folder.
           $common = @(
             '-DCMAKE_BUILD_TYPE=Release',
             '-DBUILD_SHARED_LIBS=OFF',
             '-DGGML_NATIVE=OFF',
             '-DGGML_AVX2=ON',
             '-DGGML_OPENMP=OFF',
+            '-DLLAMA_OPENSSL=OFF',
+            '-DLLAMA_CURL=OFF',
+            '-DLLAMA_BUILD_TESTS=OFF',
+            '-DLLAMA_BUILD_EXAMPLES=OFF',
             '-DCMAKE_POLICY_DEFAULT_CMP0091=NEW',
             '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded'
           )
-          cmake -S llama-src -B llama-build @common -DLLAMA_CURL=OFF
+          cmake -S llama-src -B llama-build @common
           cmake --build llama-build --config Release --target llama-server -j 4
           cmake -S whisper-src -B whisper-build @common
           cmake --build whisper-build --config Release --target whisper-cli -j 4
+
           $bin = Join-Path 'build/windows/x64/runner/Release' 'bin'
           New-Item -ItemType Directory -Force -Path $bin | Out-Null
           $llama = Get-ChildItem llama-build -Recurse -Filter llama-server.exe | Select-Object -First 1
@@ -86,34 +91,29 @@ jobs:
           Copy-Item $whisper.FullName $bin -Force
           Get-ChildItem llama-build -Recurse -Filter *.dll | ForEach-Object { Copy-Item $_.FullName $bin -Force }
           Get-ChildItem whisper-build -Recurse -Filter *.dll | ForEach-Object { Copy-Item $_.FullName $bin -Force }
+
+          # Safety net: if any OpenSSL DLL slipped in anyway, bundle it.
+          Get-ChildItem 'C:\Program Files' -Recurse -Filter 'libcrypto-3-x64.dll' -ErrorAction SilentlyContinue |
+            Select-Object -First 1 | ForEach-Object { Copy-Item $_.FullName $bin -Force; Write-Host "Bundled $($_.Name)" }
+          Get-ChildItem 'C:\Program Files' -Recurse -Filter 'libssl-3-x64.dll' -ErrorAction SilentlyContinue |
+            Select-Object -First 1 | ForEach-Object { Copy-Item $_.FullName $bin -Force; Write-Host "Bundled $($_.Name)" }
+
           Write-Host 'Files in bin:'
           Get-ChildItem $bin | ForEach-Object { Write-Host "  $($_.Name)  $($_.Length)" }
 
-      - name: Smoke test llama-server.exe
+      - name: Smoke test with a clean PATH (catches missing DLLs)
         shell: pwsh
         run: |
-          $exe = Join-Path 'build/windows/x64/runner/Release/bin' 'llama-server.exe'
-          & $exe --version
-          if ($LASTEXITCODE -ne 0) { throw "llama-server.exe failed to start, exit code $LASTEXITCODE" }
-          Write-Host 'llama-server.exe started correctly.'
-
-      - name: List DLLs needed by llama-server.exe
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          $dumpbin = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio' -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1
-          if (-not $dumpbin) { Write-Host 'dumpbin.exe not found, skipping'; exit 0 }
-          $exe = 'build/windows/x64/runner/Release/bin/llama-server.exe'
-          $out = & $dumpbin.FullName /dependents $exe
-          $out | Write-Host
-          $deps = $out | Where-Object { $_ -match '^\s+\S+\.dll\s*$' } | ForEach-Object { $_.Trim() }
           $bin = 'build/windows/x64/runner/Release/bin'
-          $system = 'kernel32|user32|advapi32|shell32|ole32|oleaut32|ws2_32|bcrypt|crypt32|secur32|ntdll|gdi32|winmm|shlwapi|iphlpapi|userenv|version|api-ms-win|ucrtbase|dbghelp|psapi|wsock32|mswsock|rpcrt4|comdlg32|imm32|setupapi|cfgmgr32|normaliz|wldap32|msvcrt'
-          foreach ($d in $deps) {
-            $inBin = Test-Path (Join-Path $bin $d)
-            $isSystem = $d -match $system
-            if (-not $inBin -and -not $isSystem) { Write-Host "NOT BUNDLED: $d" }
+          # Remove everything except Windows system folders, so only bundled DLLs are available.
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+          foreach ($exe in 'llama-server.exe', 'whisper-cli.exe') {
+            $path = Join-Path $bin $exe
+            & $path --help *> $null
+            if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1) {
+              throw "$exe cannot start on a clean PC, exit code $LASTEXITCODE"
+            }
+            Write-Host "$exe starts on a clean PATH."
           }
 
       - name: Download Visual C++ Redistributable for the installer
