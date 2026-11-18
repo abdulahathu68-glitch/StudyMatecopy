@@ -1,9 +1,11 @@
-name: Build StudyMate AI (Windows)
+name: Build StudyMate AI
 
 on:
   push:
     branches: [main]
     tags: ['v*']
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -13,9 +15,6 @@ jobs:
   windows:
     runs-on: windows-latest
     timeout-minutes: 90
-    defaults:
-      run:
-        working-directory: StudyMate-AI-main
     steps:
       - uses: actions/checkout@v4
 
@@ -42,16 +41,18 @@ jobs:
 
       - name: Analyze
         shell: pwsh
-        continue-on-error: true
         run: |
-          flutter analyze --no-pub 2>&1 | Tee-Object -FilePath analyze.log
+          $ErrorActionPreference = 'Continue'
+          flutter analyze --no-pub > analyze.log 2>&1
+          Get-Content analyze.log
+          Write-Host 'Analyzer finished. Warnings do not stop the build; compile errors do.'
           exit 0
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: analyze-log
-          path: StudyMate-AI-main/analyze.log
+          path: analyze.log
           if-no-files-found: ignore
 
       - name: Build release
@@ -62,25 +63,26 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/ggml-org/llama.cpp llama-src
           git clone --depth 1 https://github.com/ggerganov/whisper.cpp whisper-src
-          # No OpenSSL, no curl, no OpenMP, no CPU-specific code:
-          # the exe depends only on DLLs that ship with Windows or in the bin folder.
-          $common = @(
+          # OpenSSL and curl are turned off so llama-server.exe does not need libcrypto/libssl.
+          $opts = @(
             '-DCMAKE_BUILD_TYPE=Release',
             '-DBUILD_SHARED_LIBS=OFF',
+            '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded',
+            '-DGGML_OPENMP=OFF',
             '-DGGML_NATIVE=OFF',
             '-DGGML_AVX2=ON',
-            '-DGGML_OPENMP=OFF',
-            '-DLLAMA_OPENSSL=OFF',
+            '-DGGML_FMA=ON',
+            '-DGGML_F16C=ON',
+            '-DGGML_AVX512=OFF',
             '-DLLAMA_CURL=OFF',
+            '-DLLAMA_OPENSSL=OFF',
             '-DLLAMA_BUILD_TESTS=OFF',
-            '-DLLAMA_BUILD_EXAMPLES=OFF',
-            '-DCMAKE_POLICY_DEFAULT_CMP0091=NEW',
-            '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded'
+            '-DLLAMA_BUILD_EXAMPLES=OFF'
           )
-          cmake -S llama-src -B llama-build @common
-          cmake --build llama-build --config Release --target llama-server -j 4
-          cmake -S whisper-src -B whisper-build @common
-          cmake --build whisper-build --config Release --target whisper-cli -j 4
+          cmake -S llama-src -B llama-build @opts
+          cmake --build llama-build --config Release --target llama-server
+          cmake -S whisper-src -B whisper-build @opts
+          cmake --build whisper-build --config Release --target whisper-cli
 
           $bin = Join-Path 'build/windows/x64/runner/Release' 'bin'
           New-Item -ItemType Directory -Force -Path $bin | Out-Null
@@ -92,36 +94,92 @@ jobs:
           Get-ChildItem llama-build -Recurse -Filter *.dll | ForEach-Object { Copy-Item $_.FullName $bin -Force }
           Get-ChildItem whisper-build -Recurse -Filter *.dll | ForEach-Object { Copy-Item $_.FullName $bin -Force }
 
-          # Safety net: if any OpenSSL DLL slipped in anyway, bundle it.
-          Get-ChildItem 'C:\Program Files' -Recurse -Filter 'libcrypto-3-x64.dll' -ErrorAction SilentlyContinue |
-            Select-Object -First 1 | ForEach-Object { Copy-Item $_.FullName $bin -Force; Write-Host "Bundled $($_.Name)" }
-          Get-ChildItem 'C:\Program Files' -Recurse -Filter 'libssl-3-x64.dll' -ErrorAction SilentlyContinue |
-            Select-Object -First 1 | ForEach-Object { Copy-Item $_.FullName $bin -Force; Write-Host "Bundled $($_.Name)" }
-
-          Write-Host 'Files in bin:'
-          Get-ChildItem $bin | ForEach-Object { Write-Host "  $($_.Name)  $($_.Length)" }
-
-      - name: Smoke test with a clean PATH (catches missing DLLs)
-        shell: pwsh
-        run: |
-          $bin = 'build/windows/x64/runner/Release/bin'
-          # Remove everything except Windows system folders, so only bundled DLLs are available.
-          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
-          foreach ($exe in 'llama-server.exe', 'whisper-cli.exe') {
-            $path = Join-Path $bin $exe
-            & $path --help *> $null
-            if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1) {
-              throw "$exe cannot start on a clean PC, exit code $LASTEXITCODE"
+          # Find every DLL the engines import. Copy any non-Windows DLL into bin,
+          # and fail the build if one cannot be found.
+          $vsRoot = 'C:\Program Files\Microsoft Visual Studio'
+          $dumpbin = Get-ChildItem $vsRoot -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1
+          if (-not $dumpbin) { throw 'dumpbin.exe was not found on this runner' }
+          $searchDirs = @($env:PATH -split ';') + @(
+            'C:\Program Files\Git\mingw64\bin',
+            'C:\Program Files\OpenSSL-Win64\bin',
+            'C:\Program Files\OpenSSL\bin',
+            'C:\msys64\mingw64\bin'
+          )
+          function Get-DllDeps([string]$file) {
+            & $dumpbin.FullName /nologo /dependents $file | ForEach-Object {
+              if ($_ -match '^\s+(\S+\.dll)\s*$') { $matches[1] }
             }
-            Write-Host "$exe starts on a clean PATH."
+          }
+          function Test-WindowsDll([string]$name) {
+            return ($name -like 'api-ms-win-*') -or ($name -like 'ext-ms-*') -or
+              (Test-Path (Join-Path $env:SystemRoot "System32\$name"))
+          }
+          $queue = New-Object System.Collections.Queue
+          $seen = @{}
+          foreach ($f in @($llama.FullName, $whisper.FullName)) {
+            foreach ($d in Get-DllDeps $f) { $queue.Enqueue($d) }
+          }
+          while ($queue.Count -gt 0) {
+            $name = [string]$queue.Dequeue()
+            $key = $name.ToLower()
+            if ($seen.ContainsKey($key)) { continue }
+            $seen[$key] = $true
+            if (Test-WindowsDll $name) { continue }
+            if (-not (Test-Path (Join-Path $bin $name))) {
+              $src = $null
+              foreach ($dir in $searchDirs) {
+                if ($dir -and (Test-Path (Join-Path $dir $name))) { $src = Join-Path $dir $name; break }
+              }
+              if (-not $src) { throw "Required DLL $name was not found on the build machine" }
+              Copy-Item $src $bin -Force
+              Write-Host "Bundled $name from $src"
+            }
+            foreach ($d in Get-DllDeps (Join-Path $bin $name)) { $queue.Enqueue($d) }
           }
 
-      - name: Download Visual C++ Redistributable for the installer
+          Write-Host 'Files in bin:'
+          Get-ChildItem $bin | ForEach-Object { Write-Host "  $($_.Name)" }
+
+      - name: Verify engine runs with only bundled DLLs
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path redist | Out-Null
-          Invoke-WebRequest -Uri 'https://aka.ms/vs/17/release/vc_redist.x64.exe' -OutFile 'redist/vc_redist.x64.exe'
-          if (!(Test-Path 'redist/vc_redist.x64.exe')) { throw 'Could not download vc_redist.x64.exe' }
+          $bin = Resolve-Path 'build/windows/x64/runner/Release/bin'
+          $vsRoot = 'C:\Program Files\Microsoft Visual Studio'
+          $dumpbin = Get-ChildItem $vsRoot -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1
+          $missing = @()
+          foreach ($exeName in 'llama-server.exe', 'whisper-cli.exe') {
+            $exe = Join-Path $bin $exeName
+            & $dumpbin.FullName /nologo /dependents $exe | ForEach-Object {
+              if ($_ -match '^\s+(\S+\.dll)\s*$') {
+                $name = $matches[1]
+                $isWin = ($name -like 'api-ms-win-*') -or ($name -like 'ext-ms-*') -or
+                  (Test-Path (Join-Path $env:SystemRoot "System32\$name"))
+                if (-not $isWin -and -not (Test-Path (Join-Path $bin $name))) { $missing += "$exeName needs $name" }
+              }
+            }
+          }
+          if ($missing) { throw ("Missing DLLs:`n" + ($missing -join "`n")) }
+
+          # Run with only Windows system folders on PATH, like a clean PC.
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+          & (Join-Path $bin 'llama-server.exe') --version
+          if ($LASTEXITCODE -ne 0) { throw "llama-server.exe failed on a clean PATH, exit code $LASTEXITCODE" }
+          Write-Host 'llama-server.exe runs with only bundled DLLs.'
+
+      - name: Add Piper offline voice engine
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri 'https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_windows_amd64.zip' -OutFile piper.zip
+          Expand-Archive piper.zip -DestinationPath piper-tmp -Force
+          $exe = Get-ChildItem piper-tmp -Recurse -Filter piper.exe | Select-Object -First 1
+          if (-not $exe) { throw 'piper.exe was not found in the Piper download' }
+          $dest = 'build/windows/x64/runner/Release/bin/piper'
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Copy-Item (Join-Path $exe.DirectoryName '*') $dest -Recurse -Force
+          Write-Host 'Piper files:'
+          Get-ChildItem $dest | ForEach-Object { Write-Host "  $($_.Name)" }
 
       - name: Package ZIP
         shell: pwsh
@@ -137,13 +195,13 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: StudyMate-AI-Windows
-          path: StudyMate-AI-main/StudyMate-AI-Windows.zip
+          path: StudyMate-AI-Windows.zip
           if-no-files-found: error
 
       - uses: actions/upload-artifact@v4
         with:
           name: StudyMate-AI-Setup
-          path: StudyMate-AI-main/StudyMate-AI-Setup.exe
+          path: StudyMate-AI-Setup.exe
           if-no-files-found: error
 
       - name: Publish Windows release
@@ -151,5 +209,79 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            StudyMate-AI-main/StudyMate-AI-Windows.zip
-            StudyMate-AI-main/StudyMate-AI-Setup.exe
+            StudyMate-AI-Windows.zip
+            StudyMate-AI-Setup.exe
+
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install Linux build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libgtk-3-dev pkg-config clang cmake
+
+      - name: Enable Linux desktop
+        run: flutter config --enable-linux-desktop
+
+      - name: Generate Linux runner if needed
+        run: |
+          if [ ! -d linux/runner ]; then flutter create --platforms=linux .; fi
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Build Linux release
+        run: flutter build linux --release
+
+      - name: Build llama-server and whisper-cli from source
+        run: |
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp llama-src
+          git clone --depth 1 https://github.com/ggerganov/whisper.cpp whisper-src
+          cmake -S llama-src -B llama-build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_AVX512=OFF
+          cmake --build llama-build --target llama-server
+          cmake -S whisper-src -B whisper-build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_AVX512=OFF
+          cmake --build whisper-build --target whisper-cli
+          BIN=build/linux/x64/release/bundle/bin
+          mkdir -p "$BIN"
+          cp "$(find llama-build -name llama-server -type f | head -1)" "$BIN/"
+          cp "$(find whisper-build -name whisper-cli -type f | head -1)" "$BIN/"
+          chmod +x "$BIN"/*
+
+      - name: Add Piper offline voice engine
+        run: |
+          curl -L -o piper.tar.gz https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz
+          tar -xzf piper.tar.gz
+          PDEST=build/linux/x64/release/bundle/bin/piper
+          mkdir -p "$PDEST"
+          cp -r piper/* "$PDEST/"
+          test -f "$PDEST/piper"
+          chmod +x "$PDEST/piper"
+
+      - name: Assemble Linux package
+        run: |
+          mkdir -p dist
+          cp -r build/linux/x64/release/bundle dist/StudyMate-AI
+          cp linux_package/StudyMate-AI.desktop dist/StudyMate-AI/
+          cp linux_package/ARCH_INSTALL.txt dist/StudyMate-AI/
+          chmod +x dist/StudyMate-AI/studymate_ai
+          tar -czf StudyMate-AI-Linux.tar.gz -C dist StudyMate-AI
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StudyMate-AI-Linux
+          path: StudyMate-AI-Linux.tar.gz
+          if-no-files-found: error
+
+      - name: Publish Linux release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: StudyMate-AI-Linux.tar.gz
